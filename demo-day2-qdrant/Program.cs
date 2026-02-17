@@ -17,6 +17,7 @@ const string EmbeddingModel = "bge-m3";
 
 const string QdrantGrpcHost = "localhost";
 const int QdrantGrpcPort = 6334;
+const string QdrantRestUrl = "http://localhost:6333";
 const string QdrantApiKey = "demo";
 const string CollectionName = "xyz";
 
@@ -51,16 +52,158 @@ switch (processArg.ToLower())
     case "migrate":
         await RunMigrate();
         break;
+    case "migrate-with-rest":
+        await RunMigrateWithRest();
+        break;
     case "search":
         await RunSearch();
         break;
     default:
         Console.WriteLine($"Unknown command: {processArg}");
-        Console.WriteLine("Available commands: migrate, search");
+        Console.WriteLine("Available commands: migrate, migrate-with-rest, search");
         break;
 }
 
 return;
+
+// ========== Migrate with REST API: PostgreSQL -> Qdrant ==========
+async Task RunMigrateWithRest()
+{
+    Console.WriteLine("=== Migration (REST API): PostgreSQL -> Qdrant ===");
+    Console.WriteLine();
+
+    // Qdrant REST HttpClient
+    using var qdrantHttp = new HttpClient { BaseAddress = new Uri(QdrantRestUrl) };
+    qdrantHttp.DefaultRequestHeaders.Add("api-key", QdrantApiKey);
+
+    // Step 1: Read data from PostgreSQL
+    var documents = new List<Document>();
+
+    Console.WriteLine("[1/4] Reading data from PostgreSQL...");
+    await using (var conn = new NpgsqlConnection(connStr))
+    {
+        await conn.OpenAsync();
+        await using var cmd = new NpgsqlCommand("SELECT id, doc_name, doc_desc, search_text FROM documents", conn);
+        await using var reader = await cmd.ExecuteReaderAsync();
+
+        while (await reader.ReadAsync())
+        {
+            documents.Add(new Document
+            {
+                Id = reader.GetInt32(0),
+                DocName = reader.IsDBNull(1) ? "" : reader.GetString(1),
+                DocDes = reader.IsDBNull(2) ? "" : reader.GetString(2),
+                SearchText = reader.IsDBNull(3) ? "" : reader.GetString(3)
+            });
+        }
+    }
+    Console.WriteLine($"   Found {documents.Count} documents.");
+
+    if (documents.Count == 0)
+    {
+        Console.WriteLine("   No documents found. Exiting.");
+        return;
+    }
+
+    // Step 2: Generate embeddings via Ollama
+    Console.WriteLine("[2/4] Generating embeddings via Ollama (bge-m3)...");
+
+    var embeddings = new Dictionary<int, float[]>();
+    int embeddingDimension = 0;
+
+    for (int i = 0; i < documents.Count; i++)
+    {
+        var doc = documents[i];
+        var text = string.IsNullOrWhiteSpace(doc.SearchText) ? "(empty)" : doc.SearchText;
+
+        var requestBody = new { model = EmbeddingModel, input = text };
+        var response = await httpClient.PostAsJsonAsync("/api/embed", requestBody);
+        response.EnsureSuccessStatusCode();
+
+        var json = await response.Content.ReadAsStringAsync();
+        var result = JsonSerializer.Deserialize<OllamaEmbedResponse>(json);
+
+        if (result?.Embeddings == null || result.Embeddings.Count == 0)
+        {
+            Console.WriteLine($"   WARNING: No embedding returned for doc id={doc.Id}, skipping.");
+            continue;
+        }
+
+        var vector = result.Embeddings[0];
+        embeddings[doc.Id] = vector;
+        embeddingDimension = vector.Length;
+
+        Console.WriteLine($"   [{i + 1}/{documents.Count}] id={doc.Id} embedded (dim={vector.Length})");
+    }
+
+    Console.WriteLine($"   Embedding dimension: {embeddingDimension}");
+
+    if (embeddingDimension == 0)
+    {
+        Console.WriteLine("   No embeddings generated. Exiting.");
+        return;
+    }
+
+    // Step 3: Create Qdrant collection via REST
+    Console.WriteLine("[3/4] Setting up Qdrant collection (REST)...");
+
+    // Check if collection exists
+    var checkResp = await qdrantHttp.GetAsync($"/collections/{CollectionName}");
+    if (checkResp.IsSuccessStatusCode)
+    {
+        Console.WriteLine($"   Collection '{CollectionName}' exists. Deleting...");
+        var delResp = await qdrantHttp.DeleteAsync($"/collections/{CollectionName}");
+        delResp.EnsureSuccessStatusCode();
+    }
+
+    // Create collection
+    var createBody = new
+    {
+        vectors = new
+        {
+            size = embeddingDimension,
+            distance = "Cosine"
+        }
+    };
+    var createResp = await qdrantHttp.PutAsJsonAsync($"/collections/{CollectionName}", createBody);
+    createResp.EnsureSuccessStatusCode();
+    Console.WriteLine($"   Collection '{CollectionName}' created with dimension={embeddingDimension}, distance=Cosine.");
+
+    // Step 4: Upsert data into Qdrant via REST
+    Console.WriteLine("[4/4] Upserting data into Qdrant (REST)...");
+
+    var pointsList = new List<object>();
+    foreach (var doc in documents)
+    {
+        if (!embeddings.ContainsKey(doc.Id)) continue;
+
+        pointsList.Add(new
+        {
+            id = doc.Id,
+            vector = embeddings[doc.Id],
+            payload = new Dictionary<string, object>
+            {
+                ["doc_name"] = doc.DocName,
+                ["doc_des"] = doc.DocDes,
+                ["search_text"] = doc.SearchText
+            }
+        });
+    }
+
+    // Upsert in batches of 100
+    const int batchSize = 100;
+    for (int i = 0; i < pointsList.Count; i += batchSize)
+    {
+        var batch = pointsList.Skip(i).Take(batchSize).ToList();
+        var upsertBody = new { points = batch };
+        var upsertResp = await qdrantHttp.PutAsJsonAsync($"/collections/{CollectionName}/points", upsertBody);
+        upsertResp.EnsureSuccessStatusCode();
+        Console.WriteLine($"   Upserted batch {i / batchSize + 1} ({batch.Count} points)");
+    }
+
+    Console.WriteLine($"   Total points upserted: {pointsList.Count}");
+    Console.WriteLine("\nMigration (REST) done!");
+}
 
 // ========== Migrate: PostgreSQL -> Qdrant ==========
 async Task RunMigrate()
