@@ -1,0 +1,38 @@
+services:
+  qdrant01:
+    build: .
+    ports:
+      - "6333:6333"
+    environment:
+      - QDRANT__CLUSTER__ENABLED=true
+      - QDRANT__CLUSTER__NODE_NAME=qdrant01
+      - QDRANT__LOG_LEVEL=INFO
+    volumes:
+      - qdrant_data01:/qdrant/storage
+    # port=6335 is used for cluster communication between nodes
+    command: "./qdrant --uri http://qdrant01:6335"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  qdrant02:
+    build: .
+    environment:
+      - QDRANT__CLUSTER__ENABLED=true
+      - QDRANT__CLUSTER__NODE_NAME=qdrant02
+      - QDRANT__LOG_LEVEL=INFO
+    volumes:
+      - qdrant_data02:/qdrant/storage
+    command: "./qdrant --bootstrap http://qdrant01:6335 --uri http://qdrant02:6335"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+
+volumes:
+  qdrant_data01:
+  qdrant_data02:
