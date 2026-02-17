@@ -1,0 +1,7 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: 'qdrant'
+    static_configs:
+      - targets: ['qdrant01:6333', 'qdrant02:6333']

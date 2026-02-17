@@ -19,6 +19,8 @@ services:
 
   qdrant02:
     build: .
+    ports:
+      - "7333:6333"
     environment:
       - QDRANT__CLUSTER__ENABLED=true
       - QDRANT__CLUSTER__NODE_NAME=qdrant02
@@ -31,6 +33,22 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  prometheus:
+    image: prom/prometheus
+    volumes:
+      - ./configs/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+    
+    # depend on with health of qdrant01 and qdrant02
+    depends_on:
+      qdrant01:
+        condition: service_healthy
+      qdrant02:
+        condition: service_healthy
 
 
 volumes:
