@@ -96,33 +96,48 @@ async Task RunSearchWithRest()
 
     var queryVector = queryResult.Embeddings[0];
 
-    // Search Qdrant via REST API
+    // Search Qdrant via REST API — Hybrid search (dense + BM25 sparse with RRF fusion)
     using var qdrantHttp = new HttpClient { BaseAddress = new Uri(QdrantRestUrl) };
     qdrantHttp.DefaultRequestHeaders.Add("api-key", QdrantApiKey);
 
     var searchBody = new
     {
-        vector = queryVector,
-        limit = 5,
-        with_payload = true
+        prefetch = new object[]
+        {
+            new
+            {
+                query = query,          // BM25 sparse — Qdrant/bm25 tokenizes text server-side
+                @using = "bm25",
+                limit = 20
+            },
+            new
+            {
+                query = queryVector,    // Dense vector search
+                @using = "dense",
+                limit = 20
+            }
+        },
+        query = new { fusion = "rrf" },  // Reciprocal Rank Fusion
+        with_payload = true,
+        limit = 5
     };
 
-    var searchResp = await qdrantHttp.PostAsJsonAsync($"/collections/{CollectionName}/points/search", searchBody);
+    var searchResp = await qdrantHttp.PostAsJsonAsync($"/collections/{CollectionName}/points/query", searchBody);
     searchResp.EnsureSuccessStatusCode();
 
     var searchJson = await searchResp.Content.ReadAsStringAsync();
-    var searchResult = JsonSerializer.Deserialize<QdrantSearchResponse>(searchJson);
+    var searchResult = JsonSerializer.Deserialize<QdrantQueryResponse>(searchJson);
 
-    if (searchResult?.Result == null || searchResult.Result.Count == 0)
+    if (searchResult?.Result?.Points == null || searchResult.Result.Points.Count == 0)
     {
         Console.WriteLine("No results found.");
         return;
     }
 
-    Console.WriteLine($"\nTop {searchResult.Result.Count} results for: \"{query}\"");
+    Console.WriteLine($"\nTop {searchResult.Result.Points.Count} results (hybrid: dense + BM25) for: \"{query}\"");
     Console.WriteLine(new string('-', 60));
 
-    foreach (var hit in searchResult.Result)
+    foreach (var hit in searchResult.Result.Points)
     {
         var docName = hit.Payload?.ContainsKey("doc_name") == true ? hit.Payload["doc_name"].ToString() : "N/A";
         var docDes = hit.Payload?.ContainsKey("doc_des") == true ? hit.Payload["doc_des"].ToString() : "N/A";
@@ -230,18 +245,28 @@ async Task RunMigrateWithRest()
         delResp.EnsureSuccessStatusCode();
     }
 
-    // Create collection
+    // Create collection with named dense vector + BM25 sparse vector with IDF modifier
     var createBody = new
     {
-        vectors = new
+        vectors = new Dictionary<string, object>
         {
-            size = embeddingDimension,
-            distance = "Cosine"
+            ["dense"] = new
+            {
+                size = embeddingDimension,
+                distance = "Cosine"
+            }
+        },
+        sparse_vectors = new Dictionary<string, object>
+        {
+            ["bm25"] = new
+            {
+                modifier = "idf"
+            }
         }
     };
     var createResp = await qdrantHttp.PutAsJsonAsync($"/collections/{CollectionName}", createBody);
     createResp.EnsureSuccessStatusCode();
-    Console.WriteLine($"   Collection '{CollectionName}' created with dimension={embeddingDimension}, distance=Cosine.");
+    Console.WriteLine($"   Collection '{CollectionName}' created with dense(dim={embeddingDimension}, Cosine) + sparse(bm25, IDF).");
 
     // Step 4: Upsert data into Qdrant via REST
     Console.WriteLine("[4/4] Upserting data into Qdrant (REST)...");
@@ -251,15 +276,25 @@ async Task RunMigrateWithRest()
     {
         if (!embeddings.ContainsKey(doc.Id)) continue;
 
+        var searchText = string.IsNullOrWhiteSpace(doc.SearchText) ? "(empty)" : doc.SearchText;
+
         pointsList.Add(new
         {
             id = doc.Id,
-            vector = embeddings[doc.Id],
+            vector = new Dictionary<string, object>
+            {
+            ["dense"] = embeddings[doc.Id],
+            ["bm25"] = new
+            {
+                text = searchText,
+                model = "qdrant/bm25"
+            }
+            },
             payload = new Dictionary<string, object>
             {
-                ["doc_name"] = doc.DocName,
-                ["doc_des"] = doc.DocDes,
-                ["search_text"] = doc.SearchText
+            ["doc_name"] = doc.DocName,
+            ["doc_des"] = doc.DocDes,
+            ["search_text"] = doc.SearchText
             }
         });
     }
@@ -473,6 +508,18 @@ class QdrantSearchResponse
 {
     [JsonPropertyName("result")]
     public List<QdrantSearchHit>? Result { get; set; }
+}
+
+class QdrantQueryResponse
+{
+    [JsonPropertyName("result")]
+    public QdrantQueryResult? Result { get; set; }
+}
+
+class QdrantQueryResult
+{
+    [JsonPropertyName("points")]
+    public List<QdrantSearchHit>? Points { get; set; }
 }
 
 class QdrantSearchHit
