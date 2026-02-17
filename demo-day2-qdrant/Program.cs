@@ -58,10 +58,84 @@ switch (processArg.ToLower())
     case "search":
         await RunSearch();
         break;
+    case "search-with-rest":
+        await RunSearchWithRest();
+        break;
     default:
         Console.WriteLine($"Unknown command: {processArg}");
-        Console.WriteLine("Available commands: migrate, migrate-with-rest, search");
+        Console.WriteLine("Available commands: migrate, migrate-with-rest, search, search-with-rest");
         break;
+}
+
+// ========== Search with REST API: Semantic search in Qdrant ==========
+async Task RunSearchWithRest()
+{
+    Console.WriteLine("=== Semantic Search (REST API) ===");
+    Console.Write("Enter search query: ");
+    var query = Console.ReadLine();
+
+    if (string.IsNullOrWhiteSpace(query))
+    {
+        Console.WriteLine("No query provided. Exiting.");
+        return;
+    }
+
+    // Embed the query via Ollama
+    var queryRequest = new { model = EmbeddingModel, input = query };
+    var queryResponse = await httpClient.PostAsJsonAsync("/api/embed", queryRequest);
+    queryResponse.EnsureSuccessStatusCode();
+
+    var queryJson = await queryResponse.Content.ReadAsStringAsync();
+    var queryResult = JsonSerializer.Deserialize<OllamaEmbedResponse>(queryJson);
+
+    if (queryResult?.Embeddings == null || queryResult.Embeddings.Count == 0)
+    {
+        Console.WriteLine("Failed to generate embedding for query.");
+        return;
+    }
+
+    var queryVector = queryResult.Embeddings[0];
+
+    // Search Qdrant via REST API
+    using var qdrantHttp = new HttpClient { BaseAddress = new Uri(QdrantRestUrl) };
+    qdrantHttp.DefaultRequestHeaders.Add("api-key", QdrantApiKey);
+
+    var searchBody = new
+    {
+        vector = queryVector,
+        limit = 5,
+        with_payload = true
+    };
+
+    var searchResp = await qdrantHttp.PostAsJsonAsync($"/collections/{CollectionName}/points/search", searchBody);
+    searchResp.EnsureSuccessStatusCode();
+
+    var searchJson = await searchResp.Content.ReadAsStringAsync();
+    var searchResult = JsonSerializer.Deserialize<QdrantSearchResponse>(searchJson);
+
+    if (searchResult?.Result == null || searchResult.Result.Count == 0)
+    {
+        Console.WriteLine("No results found.");
+        return;
+    }
+
+    Console.WriteLine($"\nTop {searchResult.Result.Count} results for: \"{query}\"");
+    Console.WriteLine(new string('-', 60));
+
+    foreach (var hit in searchResult.Result)
+    {
+        var docName = hit.Payload?.ContainsKey("doc_name") == true ? hit.Payload["doc_name"].ToString() : "N/A";
+        var docDes = hit.Payload?.ContainsKey("doc_des") == true ? hit.Payload["doc_des"].ToString() : "N/A";
+        var searchText = hit.Payload?.ContainsKey("search_text") == true ? hit.Payload["search_text"].ToString() ?? "" : "N/A";
+
+        Console.WriteLine($"  Score: {hit.Score:F4} | ID: {hit.Id}");
+        Console.WriteLine($"  Name:  {docName}");
+        Console.WriteLine($"  Desc:  {docDes}");
+        Console.WriteLine($"  Text:  {(searchText.Length > 100 ? searchText[..100] + "..." : searchText)}");
+        Console.WriteLine(new string('-', 60));
+    }
+
+    Console.WriteLine("\nDone!");
 }
 
 return;
@@ -393,4 +467,22 @@ class OllamaEmbedResponse
 
     [JsonPropertyName("embeddings")]
     public List<float[]>? Embeddings { get; set; }
+}
+
+class QdrantSearchResponse
+{
+    [JsonPropertyName("result")]
+    public List<QdrantSearchHit>? Result { get; set; }
+}
+
+class QdrantSearchHit
+{
+    [JsonPropertyName("id")]
+    public JsonElement Id { get; set; }
+
+    [JsonPropertyName("score")]
+    public float Score { get; set; }
+
+    [JsonPropertyName("payload")]
+    public Dictionary<string, JsonElement>? Payload { get; set; }
 }
